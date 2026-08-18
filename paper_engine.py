@@ -17,7 +17,7 @@ from .config import CONFIG
 from .dexscreener_client import DexScreenerClient, extract_pair_metrics, pair_age_hours
 from .trade_logger import TradeLogger, make_record
 from .jupiter_client import estimate_price_impact_pct  # shared with backtest_engine.py — one source of truth
-
+from .token_filters import is_stablecoin_or_blacklisted  # new
 
 @dataclass
 class OpenPosition:
@@ -38,16 +38,36 @@ class PaperEngine:
         self.positions: dict[str, OpenPosition] = {}  # keyed by pair_address
         self.dex = DexScreenerClient(chain=CONFIG.dexscreener_chain)
         self.logger = TradeLogger()
+        self.blacklist: dict[str, datetime] = {}  # pair_address (or base_address) -> datetime when blacklisted
 
     # ---------- BUY SIDE ----------
 
     def evaluate_candidate(self, pair: dict) -> bool:
-        """Return True if this pair passes all buy-side filters."""
         m = extract_pair_metrics(pair)
         p = CONFIG.buy
 
         age_h = pair_age_hours(m["pair_created_at_ms"])
         if age_h is None:
+            return False
+
+        # blacklist check (use base_address as canonical id)
+        if CONFIG.risk.blacklist_after_stop_loss:
+            last = self.blacklist.get(m["base_address"])
+            if last:
+                from datetime import datetime, timezone
+                elapsed_hours = (datetime.now(timezone.utc) - last).total_seconds() / 3600.0
+                if elapsed_hours < CONFIG.risk.blacklist_cooldown_hours:
+                    print(f"[paper_engine] skipping {m['base_token']} {m['base_address']} due to blacklist ({elapsed_hours:.2f}h elapsed)")
+                    return False
+
+        # stablecoin detection: skip tokens priced near $1 or known stable mints/symbols
+        if is_stablecoin_or_blacklisted(
+            symbol=m.get("base_token"),
+            address=m.get("base_address"),
+            price_usd=m.get("price_usd"),
+            # optional: pass known stable addresses from config if you add them
+        ):
+            print(f"[paper_engine] skipping {m.get('base_token')} {m.get('base_address')} due to stablecoin heuristic (price={m.get('price_usd')})")
             return False
 
         checks = [
@@ -160,6 +180,11 @@ class PaperEngine:
             gas_cost_usd=CONFIG.risk.assumed_gas_cost_usd_per_trade,  # was missing entirely — always logged as $0
         )
         self.logger.log_trade(record)
+
+        # after logging the trade record:
+        if CONFIG.risk.blacklist_after_stop_loss and reason == "stop_loss":
+            # use base_address (token_address) as canonical id
+            self.blacklist[pos.token_address] = datetime.now(timezone.utc)
 
     # ---------- LOOP ----------
 
