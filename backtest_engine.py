@@ -85,12 +85,13 @@ class BacktestEngine:
             age_hours = (candle_time - created_at).total_seconds() / 3600
             vol_24h = rolling_24h_volume(candles, i, candle_hours=aggregate if timeframe == "hour" else 24)
 
+            # Apply buy filters using snapshot metrics (liquidity/mcap) and historical volume/age
             passes_buy = (
-                m["reserve_in_usd"] >= bp.min_liquidity_usd and       # snapshot approximation, see caveat
-                bp.min_mcap_usd <= m["fdv_usd"] <= bp.max_mcap_usd and  # snapshot approximation, see caveat
-                vol_24h >= bp.min_volume_24h_usd and                  # real historical value
-                (age_hours * 60) >= bp.min_age_minutes and
-                age_hours <= bp.max_age_hours
+                (m.get("reserve_in_usd", 0.0) >= bp.min_liquidity_usd) and       # snapshot approximation, see caveat
+                (bp.min_mcap_usd <= m.get("fdv_usd", 0.0) <= bp.max_mcap_usd) and  # snapshot approximation, see caveat
+                (vol_24h >= bp.min_volume_24h_usd) and                              # real historical value
+                ((age_hours * 60) >= bp.min_age_minutes) and
+                (age_hours <= bp.max_age_hours)
             )
 
             if not passes_buy:
@@ -101,17 +102,19 @@ class BacktestEngine:
             entry_index = i
             entry_time = candle_time
             high_water = entry_price
+            low_water = entry_price
 
             j = i + 1
             closed = False
             while j < len(candles):
                 c = candles[j]
                 high_water = max(high_water, c.high)
+                low_water = min(low_water, c.low)
                 hold_hours = (c.timestamp - candle.timestamp) / 3600
 
-                gain_at_high = ((c.high - entry_price) / entry_price) * 100
-                loss_at_low = ((c.low - entry_price) / entry_price) * 100
-                trail_dd = ((c.low - high_water) / high_water) * 100 if sp.trailing_stop_pct else 0
+                gain_at_high = ((c.high - entry_price) / entry_price) * 100 if entry_price else 0.0
+                loss_at_low = ((c.low - entry_price) / entry_price) * 100 if entry_price else 0.0
+                trail_dd = ((c.low - high_water) / high_water) * 100 if (sp.trailing_stop_pct and high_water) else 0
 
                 reason, exit_price = None, None
                 if gain_at_high >= sp.take_profit_pct:
@@ -129,7 +132,24 @@ class BacktestEngine:
 
                 if reason:
                     exit_time = datetime.fromtimestamp(c.timestamp, tz=timezone.utc)
-                    self._log_trade(m, entry_price, exit_price, reason, hold_hours, entry_time, exit_time)
+                    # compute mfe/mae from high_water/low_water relative to entry
+                    mfe_pct = ((high_water - entry_price) / entry_price) * 100 if entry_price else 0.0
+                    mae_pct = ((low_water - entry_price) / entry_price) * 100 if entry_price else 0.0
+                    self._log_trade(
+                        m,
+                        entry_price,
+                        exit_price,
+                        reason,
+                        hold_hours,
+                        entry_time,
+                        exit_time,
+                        entry_liquidity_usd=m.get("reserve_in_usd", 0.0),
+                        entry_mcap_usd=m.get("fdv_usd", 0.0),
+                        entry_volume_24h_usd=vol_24h,
+                        entry_age_hours=age_hours,
+                        mfe_pct=mfe_pct,
+                        mae_pct=mae_pct,
+                    )
                     trades_logged += 1
                     closed = True
                     i = j + 1
@@ -141,15 +161,30 @@ class BacktestEngine:
 
         return trades_logged
 
-    def _log_trade(self, pool_metrics: dict, entry_price: float, exit_price: float, reason: str, hold_hours: float, entry_time: datetime, exit_time: datetime) -> None:
+    def _log_trade(
+        self,
+        pool_metrics: dict,
+        entry_price: float,
+        exit_price: float,
+        reason: str,
+        hold_hours: float,
+        entry_time: datetime,
+        exit_time: datetime,
+        entry_liquidity_usd: float = 0.0,
+        entry_mcap_usd: float = 0.0,
+        entry_volume_24h_usd: float = 0.0,
+        entry_age_hours: float = 0.0,
+        mfe_pct: float = 0.0,
+        mae_pct: float = 0.0,
+    ) -> None:
         size_usd = self.balance_usd * (CONFIG.risk.position_size_pct / 100)
-        slippage_pct = estimate_price_impact_pct(size_usd, pool_metrics["reserve_in_usd"])
+        slippage_pct = estimate_price_impact_pct(size_usd, pool_metrics.get("reserve_in_usd", 0.0))
 
         record = make_record(
             mode="backtest",
             session_id=self.session_id,
-            token_symbol=pool_metrics["name"] or "UNKNOWN",
-            token_address=pool_metrics["pool_address"],
+            token_symbol=pool_metrics.get("name") or "UNKNOWN",
+            token_address=pool_metrics.get("pool_address"),
             wallet_balance_before_usd=self.balance_usd,
             position_size_usd=size_usd,
             buy_price_usd=entry_price,
@@ -163,6 +198,13 @@ class BacktestEngine:
             entry_time_utc=entry_time.isoformat(),
             exit_time_utc=exit_time.isoformat(),
             gas_cost_usd=CONFIG.risk.assumed_gas_cost_usd_per_trade,
+            # extra fields so backtest CSVs include the same entry snapshot info as paper_engine
+            entry_liquidity_usd=entry_liquidity_usd,
+            entry_mcap_usd=entry_mcap_usd,
+            entry_volume_24h_usd=entry_volume_24h_usd,
+            entry_age_hours=entry_age_hours,
+            mfe_pct=mfe_pct,
+            mae_pct=mae_pct,
         )
         # balance update must reflect the SAME slippage+gas-adjusted profit
         # that got logged, not the pre-slippage price difference
