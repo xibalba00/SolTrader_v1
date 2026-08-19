@@ -52,7 +52,7 @@ PARAM_BOUNDS = {
     # stop_loss_pct magnitude: 5 - 25 (we'll store negative in config)
     "stop_loss_mag": (5.0, 25.0),
     # trailing_stop_pct: 5 - 20 (can be None, but we'll sample numeric)
-    "trailing_stop_pct": (5.0, 20_000),
+    "trailing_stop_pct": (5.0, 20.0),
     # trailing_stop_activation_pct: 5 - 15
     "trailing_stop_activation_pct": (5.0, 15.0),
     # position_size_pct: 1.5 - 7.5
@@ -159,34 +159,48 @@ def compute_metrics(session_rows: list[dict], starting_balance: float):
 def objective_factory(args, inter_trial_delay: int = DEFAULT_INTER_TRIAL_DELAY, max_retries: int = DEFAULT_MAX_RETRIES):
     # Return an objective function that closes over CLI args
     def objective(trial: optuna.trial.Trial):
-        # Sample parameters (uniform within hardcoded bounds)
+        # Sample parameters (use Optuna suggest_* API)
         p = {}
-        p["min_liquidity_usd"] = trial.uniform("min_liquidity_usd", *PARAM_BOUNDS["min_liquidity_usd"])
-        p["min_volume_24h_usd"] = trial.uniform("min_volume_24h_usd", *PARAM_BOUNDS["min_volume_24h_usd"])
+        p["min_liquidity_usd"] = trial.suggest_float("min_liquidity_usd", *PARAM_BOUNDS["min_liquidity_usd"])
+        p["min_volume_24h_usd"] = trial.suggest_float("min_volume_24h_usd", *PARAM_BOUNDS["min_volume_24h_usd"])
 
-        # min_age_minutes sampled in minutes
-        p["min_age_minutes"] = trial.uniform("min_age_minutes", *PARAM_BOUNDS["min_age_minutes"])
+        # min_age_minutes sampled in minutes (integer)
+        p["min_age_minutes"] = trial.suggest_int(
+            "min_age_minutes",
+            int(PARAM_BOUNDS["min_age_minutes"][0]),
+            int(PARAM_BOUNDS["min_age_minutes"][1]),
+        )
         # max_age_hours must be >= min_age (converted to hours)
         min_age_hours = p["min_age_minutes"] / 60.0
         max_age_low = max(min_age_hours, PARAM_BOUNDS["max_age_hours"][0])
         max_age_high = PARAM_BOUNDS["max_age_hours"][1]
-        p["max_age_hours"] = trial.uniform("max_age_hours", max_age_low, max_age_high)
+        p["max_age_hours"] = trial.suggest_float("max_age_hours", float(max_age_low), float(max_age_high))
 
         # market caps: ensure max_mcap >= min_mcap
-        p["min_mcap_usd"] = trial.uniform("min_mcap_usd", *PARAM_BOUNDS["min_mcap_usd"])
+        p["min_mcap_usd"] = trial.suggest_float("min_mcap_usd", *PARAM_BOUNDS["min_mcap_usd"])
         max_mcap_low = max(p["min_mcap_usd"], PARAM_BOUNDS["max_mcap_usd"][0])
-        p["max_mcap_usd"] = trial.uniform("max_mcap_usd", max_mcap_low, PARAM_BOUNDS["max_mcap_usd"][1])
+        p["max_mcap_usd"] = trial.suggest_float(
+            "max_mcap_usd", float(max_mcap_low), float(PARAM_BOUNDS["max_mcap_usd"][1])
+        )
 
-        p["take_profit_pct"] = trial.uniform("take_profit_pct", *PARAM_BOUNDS["take_profit_pct"])
+        p["take_profit_pct"] = trial.suggest_float("take_profit_pct", *PARAM_BOUNDS["take_profit_pct"])
         # sample stop-loss magnitude (positive) then store negative in CONFIG
-        stop_loss_mag = trial.uniform("stop_loss_mag", *PARAM_BOUNDS["stop_loss_mag"])
+        stop_loss_mag = trial.suggest_float("stop_loss_mag", *PARAM_BOUNDS["stop_loss_mag"])
         p["stop_loss_pct"] = -abs(stop_loss_mag)
-        p["trailing_stop_pct"] = trial.uniform("trailing_stop_pct", *PARAM_BOUNDS["trailing_stop_pct"])
-        p["trailing_stop_activation_pct"] = trial.uniform("trailing_stop_activation_pct", *PARAM_BOUNDS["trailing_stop_activation_pct"])
+        p["trailing_stop_pct"] = trial.suggest_float("trailing_stop_pct", *PARAM_BOUNDS["trailing_stop_pct"])
+        p["trailing_stop_activation_pct"] = trial.suggest_float(
+            "trailing_stop_activation_pct", *PARAM_BOUNDS["trailing_stop_activation_pct"]
+        )
 
-        p["position_size_pct"] = trial.uniform("position_size_pct", *PARAM_BOUNDS["position_size_pct"])
-        p["blacklist_cooldown_hours"] = trial.uniform("blacklist_cooldown_hours", *PARAM_BOUNDS["blacklist_cooldown_hours"])
-        p["circuit_breaker_multiplier"] = trial.uniform("circuit_breaker_multiplier", *PARAM_BOUNDS["circuit_breaker_multiplier"])
+        p["position_size_pct"] = trial.suggest_float("position_size_pct", *PARAM_BOUNDS["position_size_pct"])
+        p["blacklist_cooldown_hours"] = trial.suggest_int(
+            "blacklist_cooldown_hours",
+            int(PARAM_BOUNDS["blacklist_cooldown_hours"][0]),
+            int(PARAM_BOUNDS["blacklist_cooldown_hours"][1]),
+        )
+        p["circuit_breaker_multiplier"] = trial.suggest_float(
+            "circuit_breaker_multiplier", *PARAM_BOUNDS["circuit_breaker_multiplier"]
+        )
 
         # Apply sampled params to CONFIG (mutate in place)
         # Buy params
