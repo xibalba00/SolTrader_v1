@@ -33,7 +33,7 @@ MASTER_CSV = os.path.join(RESULTS_DIR, "master_results.csv")
 PER_RUN_PREFIX = os.path.join(RESULTS_DIR, "trades_")
 
 
-# Parameter bounds (from your message)
+# Parameter bounds (hardcoded min/max per your request — uniform sampling within these)
 PARAM_BOUNDS = {
     # min_liquidity_usd: 10k - 250k
     "min_liquidity_usd": (10_000, 250_000),
@@ -49,10 +49,10 @@ PARAM_BOUNDS = {
     "max_mcap_usd": (1_000_000, 20_000_000),
     # take_profit_pct: 5 - 50
     "take_profit_pct": (5.0, 50.0),
-    # stop_loss_pct: -25 to -5 (stored negative in config)
-    "stop_loss_pct": (-25.0, -5.0),
+    # stop_loss_pct magnitude: 5 - 25 (we'll store negative in config)
+    "stop_loss_mag": (5.0, 25.0),
     # trailing_stop_pct: 5 - 20 (can be None, but we'll sample numeric)
-    "trailing_stop_pct": (5.0, 20.0),
+    "trailing_stop_pct": (5.0, 20_000),
     # trailing_stop_activation_pct: 5 - 15
     "trailing_stop_activation_pct": (5.0, 15.0),
     # position_size_pct: 1.5 - 7.5
@@ -62,6 +62,10 @@ PARAM_BOUNDS = {
     # circuit_breaker_multiplier: 1.5 - 5.0
     "circuit_breaker_multiplier": (1.5, 5.0),
 }
+
+# Defaults for runner behavior (user requested)
+DEFAULT_INTER_TRIAL_DELAY = 10
+DEFAULT_MAX_RETRIES = 8
 
 
 def ensure_results_dir():
@@ -152,15 +156,15 @@ def compute_metrics(session_rows: list[dict], starting_balance: float):
     }
 
 
-def objective_factory(args):
+def objective_factory(args, inter_trial_delay: int = DEFAULT_INTER_TRIAL_DELAY, max_retries: int = DEFAULT_MAX_RETRIES):
     # Return an objective function that closes over CLI args
     def objective(trial: optuna.trial.Trial):
-        # Sample parameters
+        # Sample parameters (uniform within hardcoded bounds)
         p = {}
         p["min_liquidity_usd"] = trial.uniform("min_liquidity_usd", *PARAM_BOUNDS["min_liquidity_usd"])
         p["min_volume_24h_usd"] = trial.uniform("min_volume_24h_usd", *PARAM_BOUNDS["min_volume_24h_usd"])
 
-        # min_age_minutes sample in minutes
+        # min_age_minutes sampled in minutes
         p["min_age_minutes"] = trial.uniform("min_age_minutes", *PARAM_BOUNDS["min_age_minutes"])
         # max_age_hours must be >= min_age (converted to hours)
         min_age_hours = p["min_age_minutes"] / 60.0
@@ -174,7 +178,9 @@ def objective_factory(args):
         p["max_mcap_usd"] = trial.uniform("max_mcap_usd", max_mcap_low, PARAM_BOUNDS["max_mcap_usd"][1])
 
         p["take_profit_pct"] = trial.uniform("take_profit_pct", *PARAM_BOUNDS["take_profit_pct"])
-        p["stop_loss_pct"] = trial.uniform("stop_loss_pct", *PARAM_BOUNDS["stop_loss_pct"])
+        # sample stop-loss magnitude (positive) then store negative in CONFIG
+        stop_loss_mag = trial.uniform("stop_loss_mag", *PARAM_BOUNDS["stop_loss_mag"])
+        p["stop_loss_pct"] = -abs(stop_loss_mag)
         p["trailing_stop_pct"] = trial.uniform("trailing_stop_pct", *PARAM_BOUNDS["trailing_stop_pct"])
         p["trailing_stop_activation_pct"] = trial.uniform("trailing_stop_activation_pct", *PARAM_BOUNDS["trailing_stop_activation_pct"])
 
@@ -204,11 +210,19 @@ def objective_factory(args):
 
         # Run a backtest programmatically similar to backtest.py main()
         gecko = GeckoTerminalClient()
-        try:
-            pools = gecko.get_trending_pools(pages=args.pages) + gecko.get_top_pools(pages=args.pages)
-        except Exception as e:
-            # Network or API errors should be treated as trial failures
-            raise optuna.exceptions.TrialPruned(f"Failed to fetch pools: {e}")
+
+        # fetch pools with retry/backoff to avoid hammering the API
+        attempt = 0
+        pools = []
+        while attempt < max_retries:
+            try:
+                pools = gecko.get_trending_pools(pages=args.pages) + gecko.get_top_pools(pages=args.pages)
+                break
+            except Exception as e:
+                attempt += 1
+                if attempt >= max_retries:
+                    raise optuna.exceptions.TrialPruned(f"Failed to fetch pools after {max_retries} attempts: {e}")
+                time.sleep(inter_trial_delay * attempt)
 
         # unique pools as in backtest.py
         seen = set()
@@ -267,6 +281,9 @@ def objective_factory(args):
 
         # Report intermediate values to Optuna
         trial.set_user_attr("master_row", master_row)
+
+        # inter-trial delay to avoid hammering the API
+        time.sleep(inter_trial_delay)
 
         return score
 
@@ -355,12 +372,14 @@ def main():
     parser.add_argument("--timeframe", type=str, default="hour")
     parser.add_argument("--aggregate", type=int, default=1)
     parser.add_argument("--top_k", type=int, default=10)
+    parser.add_argument("--inter_trial_delay", type=int, default=DEFAULT_INTER_TRIAL_DELAY, help="Seconds to sleep between trials to reduce API load")
+    parser.add_argument("--max_retries", type=int, default=DEFAULT_MAX_RETRIES, help="Max retries for fetching pools")
     args = parser.parse_args()
 
     ensure_results_dir()
 
     study = optuna.create_study(direction="maximize", study_name="soltrader_param_search")
-    objective = objective_factory(args)
+    objective = objective_factory(args, inter_trial_delay=args.inter_trial_delay, max_retries=args.max_retries)
 
     try:
         study.optimize(objective, n_trials=args.trials)
