@@ -131,14 +131,29 @@ class DexScreenerClient:
 
 
 def extract_pair_metrics(pair: dict) -> dict:
-    """Normalize the fields the strategy actually needs from a raw pair dict."""
+    """Normalize the fields the strategy actually needs from a raw pair dict.
+
+    Extended to also pull the multi-timeframe volume/price-change fields
+    DexScreener already includes in every pair response — these were
+    always present in the API data, just never parsed out before. No
+    extra API calls needed for any of this; it's the same response the
+    bot already fetches every poll."""
+    volume = pair.get("volume") or {}
+    price_change = pair.get("priceChange") or {}
     return {
         "pair_address": pair.get("pairAddress"),
         "base_token": pair.get("baseToken", {}).get("symbol"),
         "base_address": pair.get("baseToken", {}).get("address"),
         "price_usd": float(pair.get("priceUsd") or 0),
         "liquidity_usd": float((pair.get("liquidity") or {}).get("usd") or 0),
-        "volume_24h_usd": float((pair.get("volume") or {}).get("h24") or 0),
+        "volume_24h_usd": float(volume.get("h24") or 0),
+        "volume_5m_usd": float(volume.get("m5") or 0),
+        "volume_1h_usd": float(volume.get("h1") or 0),
+        "volume_6h_usd": float(volume.get("h6") or 0),
+        "price_change_5m_pct": float(price_change.get("m5") or 0),
+        "price_change_1h_pct": float(price_change.get("h1") or 0),
+        "price_change_6h_pct": float(price_change.get("h6") or 0),
+        "price_change_24h_pct": float(price_change.get("h24") or 0),
         "mcap_usd": float(pair.get("marketCap") or pair.get("fdv") or 0),
         "pair_created_at_ms": pair.get("pairCreatedAt"),
         "dex_id": pair.get("dexId"),

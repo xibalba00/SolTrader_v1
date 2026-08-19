@@ -16,10 +16,28 @@ LOG_FIELDS = [
     "session_id",            # links this trade back to its exact rules in session_rules.csv
     "timestamp_utc",
     "mode",                # paper | live | backtest
+    "strategy_name",
+    "strategy_version",
     "token_symbol",
     "token_address",
     "entry_time_utc",       # actual calendar time of the buy (real historical time in backtest mode)
     "exit_time_utc",        # actual calendar time of the sell
+    "entry_reason",          # short string of why this candidate passed the buy filter
+    # --- candidate snapshot AT THE MOMENT OF ENTRY — same API response
+    # already being fetched, just parsing more of it. Lets you eventually
+    # ask "did trades with X liquidity / Y volume-acceleration / Z recent
+    # momentum perform differently" instead of only seeing the outcome.
+    "entry_liquidity_usd",
+    "entry_mcap_usd",
+    "entry_volume_5m_usd",
+    "entry_volume_1h_usd",
+    "entry_volume_6h_usd",
+    "entry_volume_24h_usd",
+    "entry_price_change_5m_pct",
+    "entry_price_change_1h_pct",
+    "entry_price_change_6h_pct",
+    "entry_price_change_24h_pct",
+    "entry_age_hours",
     "wallet_balance_before_usd",
     "position_size_pct_wallet",
     "position_size_usd",
@@ -28,15 +46,24 @@ LOG_FIELDS = [
     "effective_buy_price_usd",   # what you actually paid, after slippage
     "tp_target_pct",
     "sl_target_pct",
-    "sell_reason",          # take_profit | stop_loss | max_hold_time | trailing_stop | gas_topup
+    "sell_reason",          # take_profit | stop_loss | circuit_breaker | max_hold_time | trailing_stop | gas_topup
     "sell_price_usd",        # quoted/market price before slippage
     "sell_slippage_pct",
     "effective_sell_price_usd",  # what you actually received, after slippage
     "gas_cost_usd",
     "hold_duration_minutes",
+    # --- MFE/MAE: how far the position moved in your favor / against you
+    # before it closed, regardless of where it actually exited. Answers
+    # "is my TP cutting off trades that routinely run further?" and
+    # "does my SL match where winners vs losers actually diverge?"
+    "mfe_pct",               # maximum favorable excursion — best unrealized gain seen, ever
+    "mae_pct",               # maximum adverse excursion — worst unrealized loss seen, ever
     "profit_pct",             # net of slippage AND gas
     "profit_usd",              # net of slippage AND gas
 ]
+
+STRATEGY_NAME = "trend_follow_v1"
+STRATEGY_VERSION = "2026.08.19"  # bump this string whenever entry/exit logic changes meaningfully
 
 
 @dataclass
@@ -44,10 +71,24 @@ class TradeRecord:
     session_id: str
     timestamp_utc: str
     mode: str
+    strategy_name: str
+    strategy_version: str
     token_symbol: str
     token_address: str
     entry_time_utc: str
     exit_time_utc: str
+    entry_reason: str
+    entry_liquidity_usd: float
+    entry_mcap_usd: float
+    entry_volume_5m_usd: float
+    entry_volume_1h_usd: float
+    entry_volume_6h_usd: float
+    entry_volume_24h_usd: float
+    entry_price_change_5m_pct: float
+    entry_price_change_1h_pct: float
+    entry_price_change_6h_pct: float
+    entry_price_change_24h_pct: float
+    entry_age_hours: float
     wallet_balance_before_usd: float
     position_size_pct_wallet: float
     position_size_usd: float
@@ -62,6 +103,8 @@ class TradeRecord:
     effective_sell_price_usd: float
     gas_cost_usd: float
     hold_duration_minutes: float
+    mfe_pct: float
+    mae_pct: float
     profit_pct: float
     profit_usd: float
 
@@ -167,6 +210,22 @@ def make_record(
     entry_time_utc: Optional[str] = None,
     exit_time_utc: Optional[str] = None,
     gas_cost_usd: float = 0.0,
+    strategy_name: str = STRATEGY_NAME,
+    strategy_version: str = STRATEGY_VERSION,
+    entry_reason: str = "",
+    entry_liquidity_usd: float = 0.0,
+    entry_mcap_usd: float = 0.0,
+    entry_volume_5m_usd: float = 0.0,
+    entry_volume_1h_usd: float = 0.0,
+    entry_volume_6h_usd: float = 0.0,
+    entry_volume_24h_usd: float = 0.0,
+    entry_price_change_5m_pct: float = 0.0,
+    entry_price_change_1h_pct: float = 0.0,
+    entry_price_change_6h_pct: float = 0.0,
+    entry_price_change_24h_pct: float = 0.0,
+    entry_age_hours: float = 0.0,
+    mfe_pct: float = 0.0,
+    mae_pct: float = 0.0,
 ) -> TradeRecord:
     position_size_pct_wallet = (
         (position_size_usd / wallet_balance_before_usd) * 100
@@ -200,10 +259,24 @@ def make_record(
         session_id=session_id,
         timestamp_utc=now.isoformat(),
         mode=mode,
+        strategy_name=strategy_name,
+        strategy_version=strategy_version,
         token_symbol=token_symbol,
         token_address=token_address,
         entry_time_utc=entry_time_utc,
         exit_time_utc=exit_time_utc,
+        entry_reason=entry_reason,
+        entry_liquidity_usd=round(entry_liquidity_usd, 2),
+        entry_mcap_usd=round(entry_mcap_usd, 2),
+        entry_volume_5m_usd=round(entry_volume_5m_usd, 2),
+        entry_volume_1h_usd=round(entry_volume_1h_usd, 2),
+        entry_volume_6h_usd=round(entry_volume_6h_usd, 2),
+        entry_volume_24h_usd=round(entry_volume_24h_usd, 2),
+        entry_price_change_5m_pct=round(entry_price_change_5m_pct, 2),
+        entry_price_change_1h_pct=round(entry_price_change_1h_pct, 2),
+        entry_price_change_6h_pct=round(entry_price_change_6h_pct, 2),
+        entry_price_change_24h_pct=round(entry_price_change_24h_pct, 2),
+        entry_age_hours=round(entry_age_hours, 2),
         wallet_balance_before_usd=round(wallet_balance_before_usd, 2),
         position_size_pct_wallet=round(position_size_pct_wallet, 2),
         position_size_usd=round(position_size_usd, 2),
@@ -218,6 +291,8 @@ def make_record(
         effective_sell_price_usd=effective_sell_price,
         gas_cost_usd=round(gas_cost_usd, 4),
         hold_duration_minutes=round(hold_duration_minutes, 2),
+        mfe_pct=round(mfe_pct, 2),
+        mae_pct=round(mae_pct, 2),
         profit_pct=round(profit_pct, 2),
         profit_usd=round(profit_usd, 2),
     )
@@ -270,6 +345,71 @@ def log_session_rules(
 
     with open(rules_log_path, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if needs_fresh_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+CANDIDATE_FUNNEL_FIELDS = [
+    "session_id",
+    "cycle_time_utc",
+    "total_candidates_seen",
+    "failed_no_age_data",
+    "failed_blacklist",
+    "failed_stablecoin",
+    "failed_liquidity",
+    "failed_volume",
+    "failed_age_min",
+    "failed_age_max",
+    "failed_mcap",
+    "passed_all_buy_filters",
+    "rejected_max_concurrent",
+    "rejected_already_held",
+    "rejected_size_invalid",
+    "actually_opened",
+]
+
+
+def log_candidate_funnel(
+    funnel: dict,
+    session_id: str,
+    funnel_log_path: str = "logs/candidate_funnel.csv",
+) -> None:
+    """
+    One row per discovery cycle (every poll_interval_seconds, same cadence
+    that already runs — no extra API calls, this just counts WHY each
+    already-fetched candidate passed or failed instead of only recording
+    the ones that became trades).
+
+    Answers "why only 4-5 concurrent positions out of 45-50 raw
+    candidates" directly: most candidates are failing at a specific,
+    now-visible stage (liquidity, volume, age, blacklist, etc.) rather
+    than a mystery. `funnel` is expected to already contain all
+    CANDIDATE_FUNNEL_FIELDS keys except session_id/cycle_time_utc, which
+    this function fills in.
+    """
+    row = {
+        "session_id": session_id,
+        "cycle_time_utc": datetime.now(timezone.utc).isoformat(),
+        **{k: funnel.get(k, 0) for k in CANDIDATE_FUNNEL_FIELDS if k not in ("session_id", "cycle_time_utc")},
+    }
+
+    os.makedirs(os.path.dirname(funnel_log_path), exist_ok=True)
+
+    needs_fresh_header = True
+    if os.path.exists(funnel_log_path):
+        with open(funnel_log_path, "r", newline="") as f:
+            existing_header = next(csv.reader(f), None)
+        if existing_header == CANDIDATE_FUNNEL_FIELDS:
+            needs_fresh_header = False
+        else:
+            backup_path = funnel_log_path.replace(".csv", f"_old_schema_{int(time.time())}.csv")
+            os.rename(funnel_log_path, backup_path)
+            print(f"[trade_logger] '{funnel_log_path}' had an outdated column schema — "
+                  f"archived it to '{backup_path}'.")
+
+    with open(funnel_log_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CANDIDATE_FUNNEL_FIELDS)
         if needs_fresh_header:
             writer.writeheader()
         writer.writerow(row)
