@@ -2,21 +2,47 @@
 Optuna-based parameter search runner for SolTrader_v1
 
 Usage:
-    python scripts/optuna_runner.py --trials 200 --pages 1 --timeframe hour --aggregate 1
+    python scripts/optuna_runner.py --trials 3000 --pages 1 --timeframe minute --aggregate 15
+    python scripts/optuna_runner.py --trials 3000 --pages 1 --timeframe hour   --aggregate 1
+
+FIXED-DATASET BEHAVIOR (important — this changed):
+ - Pool discovery (trending+top pools) and OHLCV candle fetching now happen
+   ONCE, at the start of main(), for the requested --timeframe/--aggregate.
+ - Every trial afterward replays that SAME cached dataset in memory — zero
+   API calls happen inside a trial. This makes trials directly comparable
+   to each other (no candidate-universe drift mid-run) and makes 1000s of
+   trials fast, since only the one-time prefetch phase touches the network.
+ - Re-running this script later (e.g. a week later) re-fetches a fresh
+   dataset — that's your out-of-sample comparison, not something to avoid.
+
+PER-TIMEFRAME OUTPUT ISOLATION:
+ - Every --timeframe/--aggregate combo writes to its own folder and files:
+   backtest_results_<timeframe>_<aggregate>/  and
+   logs/backtest_trades_<timeframe>_<aggregate>.csv
+ - Running --timeframe minute --aggregate 1, then --aggregate 5, then
+   --aggregate 15, then --timeframe hour --aggregate 1 never overwrites or
+   merges with each other — four independent output sets.
 
 Notes:
  - This imports the repo's bot.config.CONFIG and mutates fields for each trial.
  - It runs the BacktestEngine programmatically (no subprocess/config file edits).
  - Requires optuna: pip install optuna
- - Outputs per-run trades CSVs and a master_results.csv in ./backtest_results/
 """
 
 import argparse
 import csv
 import os
+import sys
 import time
 from datetime import datetime, timezone
 import math
+
+# Ensure the project root (parent of this script's /scripts folder) is on
+# sys.path, so `bot` resolves regardless of the current working directory
+# or how the script is invoked (e.g. `python3 scripts/optuna_runner.py`).
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 try:
     import optuna
@@ -25,12 +51,17 @@ except Exception as e:
 
 from bot.config import CONFIG
 from bot.geckoterminal_client import GeckoTerminalClient
-from bot.backtest_engine import BacktestEngine
+from bot.backtest_engine import BacktestEngine, prefetch_candle_cache
 from bot.trade_logger import stats_from_rows
 
+# These are placeholders — main() overwrites them with timeframe-suffixed
+# paths (e.g. backtest_results_minute_15/, master_results_minute_15.csv)
+# before ensure_results_dir()/objective_factory() run, so every timeframe
+# you run writes to its own folder/files and nothing gets merged together.
 RESULTS_DIR = "backtest_results"
 MASTER_CSV = os.path.join(RESULTS_DIR, "master_results.csv")
 PER_RUN_PREFIX = os.path.join(RESULTS_DIR, "trades_")
+TRADES_LOG_PATH = "logs/backtest_trades.csv"
 
 
 # Parameter bounds (hardcoded min/max per your request — uniform sampling within these)
@@ -156,7 +187,17 @@ def compute_metrics(session_rows: list[dict], starting_balance: float):
     }
 
 
-def objective_factory(args, inter_trial_delay: int = DEFAULT_INTER_TRIAL_DELAY, max_retries: int = DEFAULT_MAX_RETRIES):
+def objective_factory(
+    args,
+    unique_pools: list[dict],
+    candle_cache: dict,
+    inter_trial_delay: int = DEFAULT_INTER_TRIAL_DELAY,
+):
+    """unique_pools and candle_cache are fetched ONCE in main() before Optuna
+    starts (see prefetch_candle_cache in bot/backtest_engine.py) — every
+    trial below replays that same fixed dataset. No API calls happen inside
+    objective() anymore, so trials run at in-memory speed, and every trial
+    is judged against an identical, non-drifting candidate universe."""
     # Return an objective function that closes over CLI args
     def objective(trial: optuna.trial.Trial):
         # Sample parameters (use Optuna suggest_* API)
@@ -222,37 +263,18 @@ def objective_factory(args, inter_trial_delay: int = DEFAULT_INTER_TRIAL_DELAY, 
         CONFIG.risk.blacklist_cooldown_hours = float(p["blacklist_cooldown_hours"])
         CONFIG.risk.circuit_breaker_multiplier = float(p["circuit_breaker_multiplier"])
 
-        # Run a backtest programmatically similar to backtest.py main()
-        gecko = GeckoTerminalClient()
+        # unique_pools + candle_cache come from main()'s ONE-TIME prefetch —
+        # this is the fixed dataset every trial in this run is scored
+        # against. No API call happens in this function at all.
 
-        # fetch pools with retry/backoff to avoid hammering the API
-        attempt = 0
-        pools = []
-        while attempt < max_retries:
-            try:
-                pools = gecko.get_trending_pools(pages=args.pages) + gecko.get_top_pools(pages=args.pages)
-                break
-            except Exception as e:
-                attempt += 1
-                if attempt >= max_retries:
-                    raise optuna.exceptions.TrialPruned(f"Failed to fetch pools after {max_retries} attempts: {e}")
-                time.sleep(inter_trial_delay * attempt)
-
-        # unique pools as in backtest.py
-        seen = set()
-        unique_pools = []
-        for ppool in pools:
-            addr = ppool.get("attributes", {}).get("address")
-            if addr and addr not in seen:
-                seen.add(addr)
-                unique_pools.append(ppool)
-
-        session_id = datetime.now(timezone.utc).strftime(f"optuna_trial_%Y%m%d_%H%M%S_{trial.number}")
-        engine = BacktestEngine(session_id=session_id)
+        tf_suffix = f"{args.timeframe}_{args.aggregate}"
+        session_id = datetime.now(timezone.utc).strftime(f"optuna_trial_{tf_suffix}_%Y%m%d_%H%M%S_{trial.number}")
+        engine = BacktestEngine(session_id=session_id, log_path=TRADES_LOG_PATH)
 
         rows_before = len(engine.logger.read_all())
-        # Run (this will append to logs/backtest_trades.csv)
-        stats = engine.run(unique_pools, timeframe=args.timeframe, aggregate=args.aggregate)
+        # Run against the FIXED, pre-fetched dataset — candle_cache means
+        # zero API calls happen inside this trial.
+        stats = engine.run(unique_pools, timeframe=args.timeframe, aggregate=args.aggregate, candle_cache=candle_cache)
         all_rows = engine.logger.read_all()
         session_rows = all_rows[rows_before:]
 
@@ -296,8 +318,11 @@ def objective_factory(args, inter_trial_delay: int = DEFAULT_INTER_TRIAL_DELAY, 
         # Report intermediate values to Optuna
         trial.set_user_attr("master_row", master_row)
 
-        # inter-trial delay to avoid hammering the API
-        time.sleep(inter_trial_delay)
+        # No API calls happen in this function anymore (fixed dataset), so
+        # there's nothing to rate-limit here. inter_trial_delay is kept as
+        # an optional throttle only — 0 by default now, see main().
+        if inter_trial_delay:
+            time.sleep(inter_trial_delay)
 
         return score
 
@@ -380,31 +405,64 @@ def postprocess_master_and_write_gps(top_k: int = 10):
 
 
 def main():
+    global RESULTS_DIR, MASTER_CSV, PER_RUN_PREFIX, TRADES_LOG_PATH
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--trials", type=int, default=200)
     parser.add_argument("--pages", type=int, default=1)
-    parser.add_argument("--timeframe", type=str, default="hour")
-    parser.add_argument("--aggregate", type=int, default=1)
+    parser.add_argument("--timeframe", type=str, default="hour", choices=["day", "hour", "minute"])
+    parser.add_argument("--aggregate", type=int, default=1, help="day=1, hour=1/4/12, minute=1/5/15")
     parser.add_argument("--top_k", type=int, default=10)
-    parser.add_argument("--inter_trial_delay", type=int, default=DEFAULT_INTER_TRIAL_DELAY, help="Seconds to sleep between trials to reduce API load")
-    parser.add_argument("--max_retries", type=int, default=DEFAULT_MAX_RETRIES, help="Max retries for fetching pools")
+    parser.add_argument("--inter_trial_delay", type=int, default=0,
+                         help="Optional throttle between trials. Default 0 — trials run against a "
+                              "pre-fetched fixed dataset and make no API calls, so there's nothing "
+                              "to rate-limit here anymore.")
+    parser.add_argument("--candle_limit", type=int, default=1000, help="Max candles per pool (GeckoTerminal caps at 1000/call)")
     args = parser.parse_args()
+
+    # Every timeframe/aggregate combo gets its OWN results folder + master
+    # CSV + trade log — nothing from a 1min run ever lands in the same file
+    # as a 1h run. This is what "not merged into a frankenstein" means here.
+    tf_suffix = f"{args.timeframe}_{args.aggregate}"
+    RESULTS_DIR = f"backtest_results_{tf_suffix}"
+    MASTER_CSV = os.path.join(RESULTS_DIR, "master_results.csv")
+    PER_RUN_PREFIX = os.path.join(RESULTS_DIR, "trades_")
+    TRADES_LOG_PATH = f"logs/backtest_trades_{tf_suffix}.csv"
 
     ensure_results_dir()
 
-    study = optuna.create_study(direction="maximize", study_name="soltrader_param_search")
-    objective = objective_factory(args, inter_trial_delay=args.inter_trial_delay, max_retries=args.max_retries)
+    # ---- ONE-TIME fixed-dataset prefetch (this is the only phase that hits the API) ----
+    print(f"[{tf_suffix}] Discovering candidate pools (trending + top volume, pages={args.pages})...")
+    gecko = GeckoTerminalClient()
+    pools = gecko.get_trending_pools(pages=args.pages) + gecko.get_top_pools(pages=args.pages)
+    seen = set()
+    unique_pools = []
+    for ppool in pools:
+        addr = ppool.get("attributes", {}).get("address")
+        if addr and addr not in seen:
+            seen.add(addr)
+            unique_pools.append(ppool)
+    print(f"[{tf_suffix}] {len(unique_pools)} unique pools. Prefetching {args.timeframe}/{args.aggregate} OHLCV for each (one API call per pool)...")
+
+    candle_cache = prefetch_candle_cache(gecko, unique_pools, args.timeframe, args.aggregate, candle_limit=args.candle_limit)
+    print(f"[{tf_suffix}] Prefetch done: {len(candle_cache)}/{len(unique_pools)} pools cached. "
+          f"Starting {args.trials} trials against this FIXED dataset — no further API calls.")
+    # ---- End of API-touching phase. Everything below is pure in-memory compute. ----
+
+    study = optuna.create_study(direction="maximize", study_name=f"soltrader_param_search_{tf_suffix}")
+    objective = objective_factory(args, unique_pools, candle_cache, inter_trial_delay=args.inter_trial_delay)
 
     try:
         study.optimize(objective, n_trials=args.trials)
     except KeyboardInterrupt:
         print("Optimization interrupted by user — will postprocess available results.")
 
-    print(f"Finished {len(study.trials)} trials. Best trial:")
+    print(f"[{tf_suffix}] Finished {len(study.trials)} trials. Best trial:")
     if study.best_trial:
         print(study.best_trial.params)
 
     postprocess_master_and_write_gps(top_k=args.top_k)
+    print(f"[{tf_suffix}] Results: {RESULTS_DIR}/  |  Trade log: {TRADES_LOG_PATH}")
 
 
 if __name__ == "__main__":
