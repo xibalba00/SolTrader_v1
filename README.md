@@ -1,83 +1,93 @@
-# Solana Paper Trading Bot — Phase 1 Scaffold
+# Smart-Money Radar — separate experiment, separate directory
 
-Paper-trading only. No wallet keys, no live transactions. Purpose: validate
-strategy logic and produce **real** win-rate/expectancy numbers before any
-money is at risk.
+This is the "Historical Trader-Weighted Market Universe" idea: instead of
+sourcing backtest candidates from today's GeckoTerminal trending list,
+source them from tokens that a scored cohort of active/profitable Solana
+wallets actually bought. Explicitly kept in its own directory/repo per your
+call — nothing here touches `bot/config.py`, `bot/paper_engine.py`, or the
+main trade logs.
 
-## What's here
+Labeled outputs from this pipeline as **"smart-money-cohort performance,"**
+never blended into the main strategy's win-rate/expectancy numbers.
 
-- `bot/config.py` — all buy/sell/risk parameters in one place. Edit these,
-  don't hunt through the code.
-- `bot/dexscreener_client.py` — real price/liquidity/volume/mcap data from
-  DexScreener's public API.
-- `bot/jupiter_client.py` — real swap quotes from Jupiter (used to simulate
-  realistic price impact, even in paper mode).
-- `bot/paper_engine.py` — the actual strategy: applies buy filters, tracks
-  simulated positions, checks TP/SL/trailing-stop/max-hold exits.
-- `bot/trade_logger.py` — logs every closed trade to `logs/trades.csv` with:
-  wallet balance, position size (% and $), buy price, buy slippage, TP/SL
-  targets, sell reason, sell price, sell slippage, hold time, profit (% and $).
-- `bot/gas_watcher.py` — **template only**, not wired to execute. This is
-  where "sell existing tokens at market when live SOL runs low" will live
-  once you're ready to go live. Deliberately left with `NotImplementedError`
-  stubs on anything that would touch a real wallet — that's a separate,
-  explicit step, not something that should ship half-finished.
-- `main.py` — run loop.
+## Why this is two scripts, not one
 
-## Setup
+Vybe's free tier is **4 requests/minute, 12,000 credits/month**. That's the
+entire design constraint. Everything here is a slow, resumable batch job —
+not something you run inline in the live paper-trading loop.
 
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+## Pipeline
+
+```
+seed_tokens.txt (token mints — pull from your existing dexscreener_client
+                  discovery, or GeckoTerminal trending, or hand-picked)
+        |
+        v  wallet_radar_phase1.py
+Vybe /v4/tokens/{mint}/top-pnl-traders, per seed token
+        |
+        v
+logs/wallet_appearances.csv  (raw, append-only)
+        |
+        v  aggregate + score
+logs/wallet_cohort.csv   <-  scored, categorized wallet panel
+        |
+        v  wallet_radar_phase2.py
+Vybe /v4/trades, per monitored wallet
+        |
+        v
+logs/wallet_trades_raw.csv  (raw, append-only)
+        |
+        v  aggregate
+logs/token_discovery.csv   <-  candidate tokens + discovery_score +
+                                first_monitored_buy_utc
+        |
+        v  (not built yet — see "Next step" below)
+GeckoTerminal OHLCV (before_timestamp) -> backtest_engine.py
 ```
 
-## Run
+## Time/credit budget, roughly
 
-```bash
-python main.py --query "pump.fun" --iterations 20
-```
+- Phase 1, 50 seed tokens: 50 calls, ~12-13 min, ~50-100 credits (top-pnl-traders
+  is likely a cheap call).
+- Phase 2, 300 wallets: 300 calls, ~75 min, maybe 300-600 credits (trade-history
+  calls are probably pricier — unconfirmed, the client assumes 2 credits/call
+  as a placeholder, tighten this once you see real usage in Vybe's dashboard).
 
-Leave `--iterations` unset (or 0) to run continuously. Each loop:
-fetches candidates → applies buy filters from `config.py` → opens
-simulated positions → checks all open positions against exit rules →
-logs closed trades → prints a running summary (win rate, avg gain,
-avg loss, expectancy — computed from what's actually in the log, never
-fabricated).
+Both scripts checkpoint after every successful call (`logs/phase*_processed_*.txt`)
+so an SSH drop or a Ctrl+C mid-run costs you nothing — rerun the same command
+and it picks up where it left off, skipping already-harvested tokens/wallets.
 
-## Known gaps (intentional, not oversights)
+## Before running for real
 
-1. **New-pair discovery**: `DexScreenerClient.screen_new_pairs()` raises
-   `NotImplementedError` on purpose. DexScreener's free API doesn't have a
-   fully reliable "newest pairs" endpoint — for real pump.fun sniping
-   you'd want their token-boost endpoint (partial coverage) or a paid feed
-   (Birdeye, Helius webhooks). Search-based discovery (`--query`) works
-   today as a starting point.
-2. **Live execution**: `gas_watcher.py`'s `_send_transaction` and
-   `get_sol_balance` are stubs. Wiring these up means adding `solana-py`,
-   loading a keypair, and signing/submitting real transactions — a
-   deliberate, separate step once paper results justify it.
-3. **Network**: this was scaffolded in a sandboxed dev environment that
-   only allow-lists a fixed set of domains, so `api.dexscreener.com` and
-   `lite-api.jup.ag` returned 403 here. That's a sandbox restriction, not
-   a code issue — both work fine from a normal VPS with open outbound
-   internet. Test on your VPS before assuming something's broken.
+1. **Verify the Vybe endpoints.** `bot/vybe_client.py` has `VERIFY:` comments
+   on the base URL, auth header name, and the wallet-trade-history endpoint
+   specifically — those were the least consistently documented across public
+   sources. Hit each one manually with curl once, using your real key, and
+   confirm the response shape matches what the client parses before trusting
+   a multi-hour harvest run.
+2. **Start tiny.** Run Phase 1 with ~10 seed tokens and `--credit-budget 200`
+   first, look at `logs/wallet_cohort.csv`, sanity-check it's not just
+   returning the same 5 bot/MM wallets on every token, before committing a
+   real credit budget to a full run.
+3. **Set `VYBE_API_KEY`** as an environment variable before running either
+   script.
 
-## Reading the log
+## Next step (not built here)
 
-`logs/trades.csv` columns map directly to what you asked for:
-`position_size_pct_wallet`, `position_size_usd`, `buy_price_usd`,
-`buy_slippage_pct`, `tp_target_pct`, `sl_target_pct`, `sell_price_usd`,
-`sell_slippage_pct`, `profit_pct`, `profit_usd`.
+`token_discovery.csv` gives you `token_mint` + `first_monitored_buy_utc`.
+The remaining piece is a small adapter that:
+  - looks up the pool address for each mint (GeckoTerminal search or
+    DexScreener `get_token_pairs`),
+  - pulls OHLCV via `geckoterminal_client.py`'s existing `before_timestamp`
+    support,
+  - **truncates candles to `first_monitored_buy_utc` onward** — this is the
+    information-timing guard from the original write-up (section 12).
+    Feeding the strategy candles from before any monitored wallet touched
+    the token would leak information a live scan wouldn't have had.
+  - runs it through `backtest_engine.py` with `mode="smart_money_backtest"`
+    and a distinct log path (e.g. `logs/smart_money_trades.csv`), so results
+    never mix with the main paper/backtest numbers.
 
-## Next steps, in order
-
-1. Run this against real search queries for a few days, review
-   `logs/trades.csv` and the printed summary stats.
-2. Adjust `config.py` parameters based on what the *log* shows, not
-   intuition — that's the whole point of this phase.
-3. Only after that: build the historical backtester (same engine, fed
-   historical data instead of live polling) to test parameter sets
-   against a larger sample than a few days of live paper trading.
-4. Only after that: wire up live execution, starting with gas-watcher
-   sell-side only, small size, on a VPS with paid RPC.
+Worth building only after Phase 1 + Phase 2 produce a `token_discovery.csv`
+that looks sane on manual inspection — no point wiring up the backtest
+adapter against data you haven't eyeballed yet.

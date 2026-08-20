@@ -14,9 +14,17 @@ Notes:
 import argparse
 import csv
 import os
+import sys
 import time
 from datetime import datetime, timezone
 import math
+
+# Ensure the project root (parent of this script's /scripts folder) is on
+# sys.path, so `bot` resolves regardless of the current working directory
+# or how the script is invoked (e.g. `python3 scripts/optuna_runner.py`).
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 try:
     import optuna
